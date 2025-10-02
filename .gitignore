@@ -1,40 +1,33 @@
-# gradle
+# Build outputs
+/build/
+/out/
+/dist/
+/classes/
+/bin/
 
+# Gradle
 .gradle/
-build/
-out/
-classes/
+gradle-app.setting
+gradle-app.properties
 
-# eclipse
-
-*.launch
-
-# idea
-
+# IDEs
 .idea/
 *.iml
-*.ipr
-*.iws
-
-# vscode
-
-.settings/
 .vscode/
-bin/
-.classpath
-.project
+*.classpath
+*.project
+*.settings/
+*.factorypath
 
-# macos
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
 
-*.DS_Store
+# Logs
+*.log
 
-# fabric
-
-run/
-
-# java
-
-hs_err_*.log
-replay_*.log
-*.hprof
-*.jfr
+# Misc
+*.tmp
+*.swp
+*.swo

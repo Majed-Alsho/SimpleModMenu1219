@@ -1,41 +1,24 @@
 {
-	"schemaVersion": 1,
-	"id": "modid",
-	"version": "${version}",
-	"name": "Example mod",
-	"description": "This is an example description! Tell everyone what your mod is about!",
-	"authors": [
-		"Me!"
-	],
-	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
-	},
-	"license": "CC0-1.0",
-	"icon": "assets/modid/icon.png",
-	"environment": "*",
-	"entrypoints": {
-		"main": [
-			"com.example.ExampleMod"
-		],
-		"client": [
-			"com.example.ExampleModClient"
-		]
-	},
-	"mixins": [
-		"modid.mixins.json",
-		{
-			"config": "modid.client.mixins.json",
-			"environment": "client"
-		}
-	],
-	"depends": {
-		"fabricloader": ">=0.17.2",
-		"minecraft": "~1.21.8",
-		"java": ">=21",
-		"fabric-api": "*"
-	},
-	"suggests": {
-		"another-mod": "*"
-	}
+  "schemaVersion": 1,
+  "id": "simple_mod_menu",
+  "version": "1.0.0",
+  "name": "Simple Mod Menu (1.21.9)",
+  "description": "Adds a simple Mods screen (like Mod Menu) for Minecraft 1.21.9.",
+  "authors": [ "Majed" ],
+  "contact": {
+    "sources": "https://github.com/yourusername/SimpleModMenu" 
+  },
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [ "com.majed.simplemenu.SimpleModMenuClient" ]
+  },
+  "mixins": [
+    "simple_mod_menu.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.17.0",
+    "fabric-api": "*",
+    "minecraft": "1.21.9"
+  }
 }
