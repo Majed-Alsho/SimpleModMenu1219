@@ -32,11 +32,10 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 /**
- * Simple mod list screen that shows ONLY jars from the user's real .minecraft/mods.
- * Selection is done by clicking a row; details render on the right.
- * Adds: Configure (via ModMenu shim), Reveal File, Copy ID, Copy Version, Export JSON, clickable links.
- * Also shows dependency info (depends/recommends/conflicts/breaks) from fabric.mod.json.
- * NOW: sorting (Name / ID / Version) + asc/desc toggles.
+ * Mods list + details. Shows only jars from the real .minecraft/mods.
+ * Features: search, sort (name/id/version asc/desc), details with links,
+ * copy ID/version, reveal file, open config (via ModMenu shim), export JSON,
+ * and dependency peek from fabric.mod.json.
  */
 public class ModsScreen extends Screen {
     private final Screen parent;
@@ -48,17 +47,17 @@ public class ModsScreen extends Screen {
 
     private int scrollY = 0;                  // pixel offset in the list
     private static final int ROW_H = 20;      // row height
-    private static final int LIST_TOP_PAD = 8 + 20 + 6 + 22; // search area + gap + sort buttons
+    private static final int LIST_TOP_PAD = 8 + 20 + 6 + 24 + 4; // search + gap + sort row + gap
     private static final int FOOTER_H = 36;
 
     private int hoverIndex = -1;              // row index currently hovered (in filtered)
     private int selectedIndex = -1;           // row index currently selected (in filtered)
     private Path realModsDir;                 // resolved mods dir (real .minecraft/mods)
 
-    // For click edge detection without overriding input methods
+    // click edge detection without overriding input methods
     private boolean prevMouseDown = false;
 
-    // Bottom buttons we toggle
+    // Bottom buttons
     private ButtonWidget configureBtn;
     private ButtonWidget revealBtn;
     private ButtonWidget copyIdBtn;
@@ -66,14 +65,12 @@ public class ModsScreen extends Screen {
     private ButtonWidget exportJsonBtn;
 
     // Sort controls
-    private ButtonWidget sortKeyBtn;
-    private ButtonWidget sortDirBtn;
-
     private enum SortKey { NAME, ID, VERSION }
     private SortKey sortKey = SortKey.NAME;
     private boolean sortAsc = true;
+    private ButtonWidget sortNameBtn, sortIdBtn, sortVerBtn;
 
-    // Tiny status toast at the bottom-left
+    // Tiny status toast bottom-left
     private String hudMsg = null;
     private long hudUntilMs = 0;
 
@@ -87,10 +84,10 @@ public class ModsScreen extends Screen {
 
     @Override
     protected void init() {
-        // Resolve the real mods folder once
+        // Resolve real mods folder once
         this.realModsDir = resolvePreferredModsDir().toAbsolutePath().normalize();
 
-        // Collect & keep only mods coming from the real mods folder
+        // Collect & keep only mods from the real mods folder
         this.allRows = FabricLoader.getInstance()
                 .getAllMods()
                 .stream()
@@ -98,43 +95,40 @@ public class ModsScreen extends Screen {
                 .map(mc -> new ModRow(mc, mc.getMetadata()))
                 .collect(Collectors.toList());
 
+        // Initial filtered list
+        this.filtered = new ArrayList<>(this.allRows);
+        // default sort by name asc
+        applyFilterAndSort();
+
+        this.scrollY = 0;
+        this.hoverIndex = -1;
+        this.selectedIndex = -1;
+
         // Search box
         int boxW = Math.min(this.width - 360, 420);
         this.search = new TextFieldWidget(this.textRenderer, 8, 8, boxW, 20, Text.literal("Search mods"));
         this.search.setDrawsBackground(true);
         this.search.setChangedListener(s -> {
-            filterAndSort();
+            applyFilterAndSort();
+            // Keep selection valid if possible
+            if (this.selectedIndex >= filtered.size()) {
+                this.selectedIndex = filtered.isEmpty() ? -1 : filtered.size() - 1;
+            }
         });
         this.addSelectableChild(this.search);
         this.setInitialFocus(this.search);
 
-        // Sort buttons row (right side of search)
-        int sortRowY = 8 + 20 + 6; // under search
-        int btnH = 18;
-        int btnW1 = 110;
-        int btnW2 = 90;
+        // Sort buttons row (below search)
+        int sx = 8;
+        int sy = 8 + 20 + 6;
+        int sw = 110, sh = 20, gap = 6;
 
-        sortKeyBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(sortKeyLabel()),
-                b -> {
-                    // cycle NAME -> ID -> VERSION
-                    switch (sortKey) {
-                        case NAME -> sortKey = SortKey.ID;
-                        case ID -> sortKey = SortKey.VERSION;
-                        case VERSION -> sortKey = SortKey.NAME;
-                    }
-                    sortKeyBtn.setMessage(Text.literal(sortKeyLabel()));
-                    filterAndSort();
-                }).dimensions(8, sortRowY, btnW1, btnH).build());
-
-        sortDirBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(sortDirLabel()),
-                b -> {
-                    sortAsc = !sortAsc;
-                    sortDirBtn.setMessage(Text.literal(sortDirLabel()));
-                    filterAndSort();
-                }).dimensions(8 + btnW1 + 6, sortRowY, btnW2, btnH).build());
-
-        // Initial filter + sort
-        filterAndSort();
+        sortNameBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(sortLabel("Name")), b -> onClickSort(SortKey.NAME))
+                .dimensions(sx, sy, sw, sh).build());
+        sortIdBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(sortLabel("ID")), b -> onClickSort(SortKey.ID))
+                .dimensions(sx + sw + gap, sy, sw, sh).build());
+        sortVerBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(sortLabel("Version")), b -> onClickSort(SortKey.VERSION))
+                .dimensions(sx + (sw + gap) * 2, sy, sw, sh).build());
 
         // Back button
         int bw = 100, bh = 20;
@@ -198,45 +192,71 @@ public class ModsScreen extends Screen {
                 .build());
     }
 
-    private String sortKeyLabel() {
-        return switch (sortKey) {
-            case NAME -> "Sort: Name";
-            case ID -> "Sort: ID";
-            case VERSION -> "Sort: Version";
-        };
+    // ----- filtering + sorting -----
+    private void onClickSort(SortKey key) {
+        if (this.sortKey == key) {
+            this.sortAsc = !this.sortAsc;  // toggle
+        } else {
+            this.sortKey = key;
+            this.sortAsc = true;           // default to asc on change
+        }
+        applyFilterAndSort();
+        refreshSortButtonLabels();
     }
 
-    private String sortDirLabel() {
-        return sortAsc ? "Asc ▲" : "Desc ▼";
+    private void refreshSortButtonLabels() {
+        if (sortNameBtn != null) sortNameBtn.setMessage(Text.literal(sortLabel("Name")));
+        if (sortIdBtn != null)   sortIdBtn.setMessage(Text.literal(sortLabel("ID")));
+        if (sortVerBtn != null)  sortVerBtn.setMessage(Text.literal(sortLabel("Version")));
     }
 
-    private void filterAndSort() {
+    private String sortLabel(String base) {
+        // show ▲/▼ on the active key
+        String arrow = sortAsc ? " ▲" : " ▼";
+        switch (sortKey) {
+            case NAME:    return base.equals("Name") ? base + arrow : base;
+            case ID:      return base.equals("ID") ? base + arrow : base;
+            case VERSION: return base.equals("Version") ? base + arrow : base;
+            default:      return base;
+        }
+    }
+
+    private void applyFilterAndSort() {
         String q = (search == null) ? "" : search.getText().trim().toLowerCase(Locale.ROOT);
-        List<ModRow> base = new ArrayList<>(allRows);
+
         // filter
-        if (!q.isEmpty()) {
-            base = base.stream()
+        if (q.isEmpty()) {
+            this.filtered = new ArrayList<>(this.allRows);
+        } else {
+            this.filtered = this.allRows.stream()
                     .filter(r -> r.nameL.contains(q) || r.idL.contains(q) || r.versionL.contains(q))
                     .collect(Collectors.toList());
         }
-        // sort
-        Comparator<ModRow> cmp = switch (sortKey) {
-            case NAME -> Comparator.comparing(r -> r.nameL);
-            case ID -> Comparator.comparing(r -> r.idL);
-            case VERSION -> Comparator.comparing(r -> r.versionL);
-        };
-        if (!sortAsc) cmp = cmp.reversed();
-        base.sort(cmp);
 
-        this.filtered = base;
+        // sort
+        Comparator<ModRow> cmp;
+        switch (sortKey) {
+            case NAME:
+                cmp = Comparator.comparing((ModRow r) -> r.nameL);
+                break;
+            case ID:
+                cmp = Comparator.comparing((ModRow r) -> r.idL);
+                break;
+            case VERSION:
+                cmp = Comparator.comparing((ModRow r) -> r.versionL);
+                break;
+            default:
+                cmp = Comparator.comparing((ModRow r) -> r.nameL);
+                break;
+        }
+        if (!sortAsc) cmp = cmp.reversed();
+        this.filtered.sort(cmp);
+
+        // reset scrolling & hover when list changes
         this.scrollY = 0;
         this.hoverIndex = -1;
-
-        // Keep selection sane
-        if (this.selectedIndex >= filtered.size()) {
-            this.selectedIndex = filtered.isEmpty() ? -1 : filtered.size() - 1;
-        }
     }
+    // ------------------------------------
 
     private boolean isFromRealModsDir(ModContainer mc) {
         try {
@@ -300,6 +320,8 @@ public class ModsScreen extends Screen {
         // Title + search
         ctx.drawTextWithShadow(this.textRenderer, this.getTitle(), 8, 2, 0xFFFFFFFF);
         this.search.render(ctx, mouseX, mouseY, delta);
+
+        // Sort buttons row is already drawn by widgets
 
         // Split layout: list on left, details on right
         int detailPaneW = Math.max(260, this.width / 3); // right pane width
@@ -391,7 +413,7 @@ public class ModsScreen extends Screen {
         String count = "Showing " + filtered.size() + " / " + allRows.size() + " mods";
         ctx.drawTextWithShadow(this.textRenderer, count, 8, this.height - 28 - 14, 0xFFAAAAAA);
 
-        // Enable/disable buttons based on selection and config availability
+        // Enable/disable bottom buttons
         boolean hasSelection = (selectedIndex >= 0 && selectedIndex < filtered.size());
         boolean cfgActive = false;
         if (hasSelection) {
@@ -506,7 +528,7 @@ public class ModsScreen extends Screen {
             y += 12;
         }
 
-        // Contact links — draw label + blue, underlined URL; add clickable rect
+        // Contact links
         String homepage = r.meta.getContact().get("homepage").orElse(null);
         String sources  = r.meta.getContact().get("sources").orElse(null);
         String issues   = r.meta.getContact().get("issues").orElse(null);
@@ -531,7 +553,7 @@ public class ModsScreen extends Screen {
             }
         }
 
-        // -------- Dependencies --------
+        // Dependencies
         DepInfo deps = loadDepInfo(r);
         if (!deps.isEmpty()) {
             y += 8;
@@ -551,7 +573,6 @@ public class ModsScreen extends Screen {
                 y += 2;
             }
         }
-        // -----------------------------------
     }
 
     // Draw a label + clickable URL, underline the URL, register a hitbox, advance Y
@@ -564,12 +585,9 @@ public class ModsScreen extends Screen {
         ctx.drawTextWithShadow(this.textRenderer, url, urlX, y, linkColor);
 
         int urlW = this.textRenderer.getWidth(url);
-        // underline (a thin line just under the text)
-        ctx.fill(urlX, y + 10, urlX + urlW, y + 11, linkColor);
+        ctx.fill(urlX, y + 10, urlX + urlW, y + 11, linkColor); // underline
 
-        // record clickable area (roughly one line high)
-        linkSpans.add(new LinkSpan(urlX, y, urlW, 12, url));
-
+        linkSpans.add(new LinkSpan(urlX, y, urlW, 12, url)); // clickable area
         return y + 12;
     }
 
@@ -603,13 +621,13 @@ public class ModsScreen extends Screen {
             JsonObject root = readFabricJson(p);
             if (root == null) return out;
 
-            // Keys to read. "breaks" is treated as conflicts too.
+            // Keys to read. "breaks" treated as conflicts too.
             collectIds(root, "depends", out.depends);
             collectIds(root, "recommends", out.recommends);
             collectIds(root, "conflicts", out.conflicts);
             collectIds(root, "breaks", out.conflicts);
 
-            // Clean + dedupe in place
+            // Clean + dedupe
             dedupeInPlace(out.depends);
             dedupeInPlace(out.recommends);
             dedupeInPlace(out.conflicts);
