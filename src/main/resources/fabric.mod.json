@@ -1,24 +1,33 @@
 {
   "schemaVersion": 1,
   "id": "simple_mod_menu",
-  "version": "1.0.0",
-  "name": "Simple Mod Menu (1.21.9)",
-  "description": "Adds a simple Mods screen (like Mod Menu) for Minecraft 1.21.9.",
-  "authors": [ "Majed" ],
+  "version": "v1.0.0",
+  "name": "Simple Mod Menu",
+  "description": "A clean single-screen mods UI: left list (real .minecraft/mods only), right detail pane, search, config launcher, reveal file, copy id/version, clickable links, export JSON.",
+  "authors": ["Majed"],
   "contact": {
-    "sources": "https://github.com/yourusername/SimpleModMenu" 
+    "homepage": "https://github.com/Majed-Alsho",
+    "sources":  "https://github.com/Majed-Alsho/SimpleModMenu1219",
+    "issues":   "https://github.com/Majed-Alsho/SimpleModMenu1219/issues",
+    "download": "https://github.com/Majed-Alsho/SimpleModMenu1219/releases/tag/v1.0.0-1.21"
   },
   "license": "MIT",
+  "icon": "assets/simple_mod_menu/minecraft_icon.png",
+
   "environment": "client",
+
   "entrypoints": {
-    "client": [ "com.majed.simplemenu.SimpleModMenuClient" ]
+    "client": [
+      "com.majed.simplemenu.SimpleModMenuClient"
+    ]
   },
+
   "mixins": [
     "simple_mod_menu.mixins.json"
   ],
+
   "depends": {
-    "fabricloader": ">=0.17.0",
-    "fabric-api": "*",
-    "minecraft": "1.21.9"
+    "fabricloader": ">=0.15.0",
+    "minecraft": ">=1.21"
   }
 }

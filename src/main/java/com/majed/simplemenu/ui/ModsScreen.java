@@ -14,18 +14,29 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Util;
 
 import java.awt.Desktop;
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.InputStreamReader;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.stream.Collectors;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 /**
  * Simple mod list screen that shows ONLY jars from the user's real .minecraft/mods.
  * Selection is done by clicking a row; details render on the right.
- * Adds: Configure (via ModMenu shim), Reveal File, Copy ID, Copy Version, and CLICKABLE links.
+ * Adds: Configure (via ModMenu shim), Reveal File, Copy ID, Copy Version, Export JSON, clickable links.
+ * Also shows dependency info (depends/recommends/conflicts/breaks) from fabric.mod.json.
+ * NOW: sorting (Name / ID / Version) + asc/desc toggles.
  */
 public class ModsScreen extends Screen {
     private final Screen parent;
@@ -37,7 +48,7 @@ public class ModsScreen extends Screen {
 
     private int scrollY = 0;                  // pixel offset in the list
     private static final int ROW_H = 20;      // row height
-    private static final int LIST_TOP_PAD = 8 + 20 + 6; // search area height + gap
+    private static final int LIST_TOP_PAD = 8 + 20 + 6 + 22; // search area + gap + sort buttons
     private static final int FOOTER_H = 36;
 
     private int hoverIndex = -1;              // row index currently hovered (in filtered)
@@ -52,6 +63,15 @@ public class ModsScreen extends Screen {
     private ButtonWidget revealBtn;
     private ButtonWidget copyIdBtn;
     private ButtonWidget copyVerBtn;
+    private ButtonWidget exportJsonBtn;
+
+    // Sort controls
+    private ButtonWidget sortKeyBtn;
+    private ButtonWidget sortDirBtn;
+
+    private enum SortKey { NAME, ID, VERSION }
+    private SortKey sortKey = SortKey.NAME;
+    private boolean sortAsc = true;
 
     // Tiny status toast at the bottom-left
     private String hudMsg = null;
@@ -76,37 +96,45 @@ public class ModsScreen extends Screen {
                 .stream()
                 .filter(this::isFromRealModsDir)
                 .map(mc -> new ModRow(mc, mc.getMetadata()))
-                .sorted(Comparator.comparing(r -> r.nameL))
                 .collect(Collectors.toList());
-
-        this.filtered = new ArrayList<>(this.allRows);
-        this.scrollY = 0;
-        this.hoverIndex = -1;
-        this.selectedIndex = -1;
 
         // Search box
         int boxW = Math.min(this.width - 360, 420);
         this.search = new TextFieldWidget(this.textRenderer, 8, 8, boxW, 20, Text.literal("Search mods"));
         this.search.setDrawsBackground(true);
         this.search.setChangedListener(s -> {
-            String q = s.trim().toLowerCase(Locale.ROOT);
-            if (q.isEmpty()) {
-                this.filtered = new ArrayList<>(this.allRows);
-            } else {
-                this.filtered = this.allRows.stream()
-                        .filter(r -> r.nameL.contains(q) || r.idL.contains(q) || r.versionL.contains(q))
-                        .collect(Collectors.toList());
-            }
-            this.scrollY = 0;
-            this.hoverIndex = -1;
-
-            // Keep selection valid if possible
-            if (this.selectedIndex >= filtered.size()) {
-                this.selectedIndex = filtered.isEmpty() ? -1 : filtered.size() - 1;
-            }
+            filterAndSort();
         });
         this.addSelectableChild(this.search);
         this.setInitialFocus(this.search);
+
+        // Sort buttons row (right side of search)
+        int sortRowY = 8 + 20 + 6; // under search
+        int btnH = 18;
+        int btnW1 = 110;
+        int btnW2 = 90;
+
+        sortKeyBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(sortKeyLabel()),
+                b -> {
+                    // cycle NAME -> ID -> VERSION
+                    switch (sortKey) {
+                        case NAME -> sortKey = SortKey.ID;
+                        case ID -> sortKey = SortKey.VERSION;
+                        case VERSION -> sortKey = SortKey.NAME;
+                    }
+                    sortKeyBtn.setMessage(Text.literal(sortKeyLabel()));
+                    filterAndSort();
+                }).dimensions(8, sortRowY, btnW1, btnH).build());
+
+        sortDirBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(sortDirLabel()),
+                b -> {
+                    sortAsc = !sortAsc;
+                    sortDirBtn.setMessage(Text.literal(sortDirLabel()));
+                    filterAndSort();
+                }).dimensions(8 + btnW1 + 6, sortRowY, btnW2, btnH).build());
+
+        // Initial filter + sort
+        filterAndSort();
 
         // Back button
         int bw = 100, bh = 20;
@@ -161,6 +189,53 @@ public class ModsScreen extends Screen {
         copyIdBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Copy ID"),
                 b -> copySelectedId())
                 .dimensions(center - wCfg / 2 - spacing - 120 - spacing - wSmall, y, wSmall, bh).build());
+
+        // Export JSON — placed left of "Copy ID"
+        int exportW = 110;
+        exportJsonBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Export JSON"),
+                b -> exportFilteredToJson())
+                .dimensions(center - wCfg / 2 - spacing - 120 - spacing - wSmall - spacing - exportW, y, exportW, bh)
+                .build());
+    }
+
+    private String sortKeyLabel() {
+        return switch (sortKey) {
+            case NAME -> "Sort: Name";
+            case ID -> "Sort: ID";
+            case VERSION -> "Sort: Version";
+        };
+    }
+
+    private String sortDirLabel() {
+        return sortAsc ? "Asc ▲" : "Desc ▼";
+    }
+
+    private void filterAndSort() {
+        String q = (search == null) ? "" : search.getText().trim().toLowerCase(Locale.ROOT);
+        List<ModRow> base = new ArrayList<>(allRows);
+        // filter
+        if (!q.isEmpty()) {
+            base = base.stream()
+                    .filter(r -> r.nameL.contains(q) || r.idL.contains(q) || r.versionL.contains(q))
+                    .collect(Collectors.toList());
+        }
+        // sort
+        Comparator<ModRow> cmp = switch (sortKey) {
+            case NAME -> Comparator.comparing(r -> r.nameL);
+            case ID -> Comparator.comparing(r -> r.idL);
+            case VERSION -> Comparator.comparing(r -> r.versionL);
+        };
+        if (!sortAsc) cmp = cmp.reversed();
+        base.sort(cmp);
+
+        this.filtered = base;
+        this.scrollY = 0;
+        this.hoverIndex = -1;
+
+        // Keep selection sane
+        if (this.selectedIndex >= filtered.size()) {
+            this.selectedIndex = filtered.isEmpty() ? -1 : filtered.size() - 1;
+        }
     }
 
     private boolean isFromRealModsDir(ModContainer mc) {
@@ -299,10 +374,8 @@ public class ModsScreen extends Screen {
             for (LinkSpan s : linkSpans) {
                 if (s.contains(mouseX, mouseY)) {
                     openUrl(s.url);
-                    // Don’t also change selection if we clicked a link
                     mouseDown = true;
                     prevMouseDown = true;
-                    // early update HUD and exit the edge handler
                     break;
                 }
             }
@@ -333,6 +406,7 @@ public class ModsScreen extends Screen {
         if (revealBtn != null)    revealBtn.active    = hasSelection;
         if (copyIdBtn != null)    copyIdBtn.active    = hasSelection;
         if (copyVerBtn != null)   copyVerBtn.active   = hasSelection;
+        if (exportJsonBtn != null) exportJsonBtn.active = true;
 
         // Tiny toast
         if (hudMsg != null && Util.getMeasuringTimeMs() < hudUntilMs) {
@@ -341,6 +415,59 @@ public class ModsScreen extends Screen {
 
         super.render(ctx, mouseX, mouseY, delta);
     }
+
+    // ---------- Export helpers ----------
+    private void exportFilteredToJson() {
+        try {
+            String json = buildJson(filtered);
+            MinecraftClient.getInstance().keyboard.setClipboard(json);
+
+            Path out = FabricLoader.getInstance().getGameDir().resolve("mods-list.json");
+            Files.writeString(out, json);
+            toast("Exported: " + out.getFileName());
+        } catch (Exception e) {
+            toast("Export failed");
+        }
+    }
+
+    private static String buildJson(List<ModRow> rows) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("[\n");
+        for (int i = 0; i < rows.size(); i++) {
+            ModRow r = rows.get(i);
+            String path = "";
+            try {
+                Optional<Path> p = r.container.getOrigin().getPaths().stream().findFirst();
+                path = p.map(Path::toString).orElse("");
+            } catch (Throwable ignored) { }
+
+            sb.append("  {")
+              .append("\"id\":\"").append(esc(r.id)).append("\",")
+              .append("\"name\":\"").append(esc(r.name)).append("\",")
+              .append("\"version\":\"").append(esc(r.version)).append("\",")
+              .append("\"path\":\"").append(esc(path)).append("\"")
+              .append("}");
+            if (i < rows.size() - 1) sb.append(",");
+            sb.append("\n");
+        }
+        sb.append("]\n");
+        return sb.toString();
+    }
+
+    private static String esc(String s) {
+        if (s == null) return "";
+        StringBuilder out = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' || c == '\"') { out.append('\\').append(c); }
+            else if (c == '\n') { out.append("\\n"); }
+            else if (c == '\r') { out.append("\\r"); }
+            else if (c == '\t') { out.append("\\t"); }
+            else { out.append(c); }
+        }
+        return out.toString();
+    }
+    // ---------- /Export helpers ----------
 
     private void drawDetailsPane(DrawContext ctx, int left, int top, int paneW, int bottom) {
         int x = left + 8;
@@ -366,13 +493,7 @@ public class ModsScreen extends Screen {
         String desc = r.meta.getDescription() == null ? "" : r.meta.getDescription().trim();
         if (!desc.isEmpty()) {
             y += 6;
-            int maxW = paneW - 8 - 8;
-            List<OrderedText> wrapped = this.textRenderer.wrapLines(Text.literal(desc), maxW);
-            for (OrderedText line : wrapped) {
-                if (y + 12 > bottom - 8) break;
-                ctx.drawTextWithShadow(this.textRenderer, line, x, y, 0xFFDDDDDD);
-                y += 12;
-            }
+            y = wrapAndDraw(ctx, desc, x, y, paneW - 16, 0xFFDDDDDD);
         }
 
         // Authors
@@ -389,10 +510,12 @@ public class ModsScreen extends Screen {
         String homepage = r.meta.getContact().get("homepage").orElse(null);
         String sources  = r.meta.getContact().get("sources").orElse(null);
         String issues   = r.meta.getContact().get("issues").orElse(null);
+        String download = r.meta.getContact().get("download").orElse(null); // custom
 
         if ((homepage != null && !homepage.isBlank())
                 || (sources  != null && !sources.isBlank())
-                || (issues   != null && !issues.isBlank())) {
+                || (issues   != null && !issues.isBlank())
+                || (download != null && !download.isBlank())) {
             y += 6;
             if (homepage != null && !homepage.isBlank()) {
                 y = drawLinkLine(ctx, "Homepage: ", homepage, x, y);
@@ -403,7 +526,32 @@ public class ModsScreen extends Screen {
             if (issues != null && !issues.isBlank()) {
                 y = drawLinkLine(ctx, "Issues: ", issues, x, y);
             }
+            if (download != null && !download.isBlank()) {
+                y = drawLinkLine(ctx, "Download: ", download, x, y);
+            }
         }
+
+        // -------- Dependencies --------
+        DepInfo deps = loadDepInfo(r);
+        if (!deps.isEmpty()) {
+            y += 8;
+            ctx.drawTextWithShadow(this.textRenderer, "Dependencies", x, y, 0xFFFFEE99);
+            y += 12;
+
+            if (!deps.depends.isEmpty()) {
+                y = wrapAndDraw(ctx, "Depends: " + String.join(", ", deps.depends), x, y, paneW - 16, 0xFFE6E6E6);
+                y += 2;
+            }
+            if (!deps.recommends.isEmpty()) {
+                y = wrapAndDraw(ctx, "Recommends: " + String.join(", ", deps.recommends), x, y, paneW - 16, 0xFFE6E6E6);
+                y += 2;
+            }
+            if (!deps.conflicts.isEmpty()) {
+                y = wrapAndDraw(ctx, "Conflicts: " + String.join(", ", deps.conflicts), x, y, paneW - 16, 0xFFFFBBBB);
+                y += 2;
+            }
+        }
+        // -----------------------------------
     }
 
     // Draw a label + clickable URL, underline the URL, register a hitbox, advance Y
@@ -424,6 +572,125 @@ public class ModsScreen extends Screen {
 
         return y + 12;
     }
+
+    // Wrap helper
+    private int wrapAndDraw(DrawContext ctx, String text, int x, int startY, int maxW, int color) {
+        List<OrderedText> wrapped = this.textRenderer.wrapLines(Text.literal(text), Math.max(20, maxW));
+        int y = startY;
+        for (OrderedText line : wrapped) {
+            ctx.drawTextWithShadow(this.textRenderer, line, x, y, color);
+            y += 12;
+        }
+        return y;
+    }
+
+    // --------- Dependency reader ---------
+    private static class DepInfo {
+        final List<String> depends = new ArrayList<>();
+        final List<String> recommends = new ArrayList<>();
+        final List<String> conflicts = new ArrayList<>();
+        boolean isEmpty() {
+            return depends.isEmpty() && recommends.isEmpty() && conflicts.isEmpty();
+        }
+    }
+
+    private DepInfo loadDepInfo(ModRow r) {
+        DepInfo out = new DepInfo();
+        try {
+            Path p = primaryPath(r);
+            if (p == null) return out;
+
+            JsonObject root = readFabricJson(p);
+            if (root == null) return out;
+
+            // Keys to read. "breaks" is treated as conflicts too.
+            collectIds(root, "depends", out.depends);
+            collectIds(root, "recommends", out.recommends);
+            collectIds(root, "conflicts", out.conflicts);
+            collectIds(root, "breaks", out.conflicts);
+
+            // Clean + dedupe in place
+            dedupeInPlace(out.depends);
+            dedupeInPlace(out.recommends);
+            dedupeInPlace(out.conflicts);
+        } catch (Throwable ignored) { }
+        return out;
+    }
+
+    private static void dedupeInPlace(List<String> list) {
+        if (list.isEmpty()) return;
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        for (String s : list) {
+            if (s == null) continue;
+            String t = s.trim();
+            if (!t.isEmpty()) set.add(t);
+        }
+        list.clear();
+        list.addAll(set);
+    }
+
+    private static void collectIds(JsonObject root, String key, List<String> sink) {
+        if (!root.has(key)) return;
+        JsonElement el = root.get(key);
+        if (el.isJsonObject()) {
+            for (Map.Entry<String, JsonElement> e : el.getAsJsonObject().entrySet()) {
+                String id = e.getKey();
+                String constraint = constraintToString(e.getValue());
+                sink.add(constraint == null || constraint.isBlank() ? id : id + " " + constraint);
+            }
+        } else if (el.isJsonArray()) {
+            for (JsonElement e : el.getAsJsonArray()) {
+                if (e.isJsonPrimitive()) {
+                    sink.add(e.getAsString());
+                } else if (e.isJsonObject()) {
+                    JsonObject obj = e.getAsJsonObject();
+                    String id = obj.has("id") ? obj.get("id").getAsString() : null;
+                    String c = constraintToString(obj.get("versions"));
+                    if (id != null) sink.add(c == null || c.isBlank() ? id : id + " " + c);
+                }
+            }
+        } else if (el.isJsonPrimitive()) {
+            sink.add(el.getAsString());
+        }
+    }
+
+    private static String constraintToString(JsonElement val) {
+        if (val == null) return null;
+        if (val.isJsonPrimitive()) return "(" + val.getAsString() + ")";
+        if (val.isJsonArray()) {
+            List<String> parts = new ArrayList<>();
+            for (JsonElement e : val.getAsJsonArray()) {
+                if (e.isJsonPrimitive()) parts.add(e.getAsString());
+            }
+            return parts.isEmpty() ? null : "(" + String.join(" & ", parts) + ")";
+        }
+        return null;
+    }
+
+    private static JsonObject readFabricJson(Path origin) {
+        try {
+            if (Files.isDirectory(origin)) {
+                Path fmj = origin.resolve("fabric.mod.json");
+                if (!Files.exists(fmj)) return null;
+                String s = Files.readString(fmj, StandardCharsets.UTF_8);
+                return JsonParser.parseString(s).getAsJsonObject();
+            } else {
+                try (ZipFile zip = new ZipFile(origin.toFile())) {
+                    ZipEntry e = zip.getEntry("fabric.mod.json");
+                    if (e == null) return null;
+                    try (BufferedReader br = new BufferedReader(
+                            new InputStreamReader(zip.getInputStream(e), StandardCharsets.UTF_8))) {
+                        StringBuilder sb = new StringBuilder();
+                        String line;
+                        while ((line = br.readLine()) != null) sb.append(line).append('\n');
+                        return JsonParser.parseString(sb.toString()).getAsJsonObject();
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+    // --------- /Dependency reader ---------
 
     private void openConfigForSelected() {
         if (selectedIndex < 0 || selectedIndex >= filtered.size()) return;
