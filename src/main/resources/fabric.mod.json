@@ -6,13 +6,13 @@
   "description": "A clean single-screen mods UI: left list (real .minecraft/mods only), right detail pane, search, config launcher, reveal file, copy id/version, clickable links, export JSON.",
   "authors": ["Majed"],
   "contact": {
-    "homepage": "https://github.com/Majed-Alsho",
+    "homepage": "https://github.com/Majed-Alsho/SimpleModMenu1219",
     "sources":  "https://github.com/Majed-Alsho/SimpleModMenu1219",
     "issues":   "https://github.com/Majed-Alsho/SimpleModMenu1219/issues",
     "download": "https://github.com/Majed-Alsho/SimpleModMenu1219/releases/tag/v1.0.0-1.21"
   },
   "license": "MIT",
-  "icon": "assets/simple_mod_menu/minecraft_icon.png",
+  "icon": "assets/simple_mod_menu/icon.png",
 
   "environment": "client",
 
