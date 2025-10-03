@@ -2,7 +2,6 @@ package com.majed.simplemenu.ui;
 
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.api.ModContainer;
-import net.fabricmc.loader.api.metadata.ModEnvironment;
 import net.fabricmc.loader.api.metadata.ModMetadata;
 
 import net.minecraft.client.MinecraftClient;
@@ -20,9 +19,7 @@ import java.io.File;
 import java.io.InputStreamReader;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.nio.file.*;
 import java.util.*;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -33,9 +30,13 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 /**
- * Simple mod list screen that shows ONLY jars from the user's real .minecraft/mods.
- * Search + sort + detail panel + actions + JSON export + dependency peek + clickable links.
- * NOW: quick filters for Client / Server / Libraries.
+ * Mods screen (single screen) that reads ONLY from the real .minecraft/mods folder.
+ * Features:
+ * - Search
+ * - Sort (name/id/version + asc/desc)
+ * - Details pane (desc, authors, links, dependency peek)
+ * - Actions: Configure, Reveal File, Copy ID, Copy Version, Export JSON
+ * - NEW: Enable/Disable (moves jar to mods/disabled/ and back)
  */
 public class ModsScreen extends Screen {
     private final Screen parent;
@@ -47,42 +48,35 @@ public class ModsScreen extends Screen {
 
     private int scrollY = 0;                  // pixel offset in the list
     private static final int ROW_H = 20;      // row height
-    private static final int LIST_TOP_PAD = 8 + 20 + 6 + 22 + 6; // search(20)+gap + filter row(22)+gap
+    private static final int LIST_TOP_PAD = 8 + 20 + 6 + 22; // search area + sort row + gap
     private static final int FOOTER_H = 36;
 
     private int hoverIndex = -1;              // row index currently hovered (in filtered)
     private int selectedIndex = -1;           // row index currently selected (in filtered)
     private Path realModsDir;                 // resolved mods dir (real .minecraft/mods)
 
-    // click edge detection (don’t rely on overridable signatures)
+    // For click edge detection without overriding input methods
     private boolean prevMouseDown = false;
 
-    // Bottom buttons
+    // Bottom buttons we toggle
     private ButtonWidget configureBtn;
     private ButtonWidget revealBtn;
     private ButtonWidget copyIdBtn;
     private ButtonWidget copyVerBtn;
     private ButtonWidget exportJsonBtn;
+    private ButtonWidget toggleEnableBtn;     // NEW
 
-    // Quick filter buttons
-    private ButtonWidget filterClientBtn;
-    private ButtonWidget filterServerBtn;
-    private ButtonWidget filterLibBtn;
-
-    private boolean showClient = true;
-    private boolean showServer = true;
-    private boolean showLibraries = true;
-
-    // Sorting (kept minimal; if you already had controls, they’ll continue to work)
+    // Sort controls
     private enum SortKey { NAME, ID, VERSION }
     private SortKey sortKey = SortKey.NAME;
     private boolean sortAsc = true;
+    private ButtonWidget sortNameBtn, sortIdBtn, sortVerBtn, sortDirBtn;
 
-    // Tiny status toast
+    // Tiny status toast at the bottom-left
     private String hudMsg = null;
     private long hudUntilMs = 0;
 
-    // Link hitboxes
+    // Link hitboxes built during details rendering (right pane)
     private final List<LinkSpan> linkSpans = new ArrayList<>();
 
     public ModsScreen(Screen parent) {
@@ -92,58 +86,46 @@ public class ModsScreen extends Screen {
 
     @Override
     protected void init() {
-        // resolve real mods dir
+        // Resolve the real mods folder once
         this.realModsDir = resolvePreferredModsDir().toAbsolutePath().normalize();
 
-        // collect only mods actually under the real mods dir
-        this.allRows = FabricLoader.getInstance()
-                .getAllMods()
-                .stream()
-                .filter(this::isFromRealModsDir)
-                .map(mc -> new ModRow(mc, mc.getMetadata()))
-                .sorted(Comparator.comparing(r -> r.nameL))
-                .collect(Collectors.toList());
-
-        // enrich rows with env/library info (safe + cached)
-        for (ModRow r : allRows) {
-            fillEnvAndLibrary(r);
-        }
-
-        this.filtered = new ArrayList<>(this.allRows);
-        this.scrollY = 0;
-        this.hoverIndex = -1;
-        this.selectedIndex = -1;
+        // Fill list
+        reloadModsList();
 
         // Search box
-        int boxW = Math.min(this.width - 360, 420);
+        int boxW = Math.min(this.width - 480, 460);
         this.search = new TextFieldWidget(this.textRenderer, 8, 8, boxW, 20, Text.literal("Search mods"));
         this.search.setDrawsBackground(true);
         this.search.setChangedListener(s -> {
-            refilterAndResort();
+            refilterAndSort();
+            // Keep selection valid if possible
+            if (this.selectedIndex >= filtered.size()) {
+                this.selectedIndex = filtered.isEmpty() ? -1 : filtered.size() - 1;
+            }
         });
         this.addSelectableChild(this.search);
         this.setInitialFocus(this.search);
 
-        // Quick filter buttons row (under search)
-        int fxY = 8 + 20 + 6; // under search
-        int fxW = 90, fxH = 20, gap = 6;
-        filterClientBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(labelClient()), b -> {
-            showClient = !showClient; b.setMessage(Text.literal(labelClient())); refilterAndResort();
-        }).dimensions(8, fxY, fxW, fxH).build());
+        // Sort row (right of search)
+        int sortRowY = 8;
+        int sx = 8 + boxW + 10;
+        int bh = 20, bw = 70, gap = 6;
 
-        filterServerBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(labelServer()), b -> {
-            showServer = !showServer; b.setMessage(Text.literal(labelServer())); refilterAndResort();
-        }).dimensions(8 + fxW + gap, fxY, fxW, fxH).build());
-
-        filterLibBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal(labelLib()), b -> {
-            showLibraries = !showLibraries; b.setMessage(Text.literal(labelLib())); refilterAndResort();
-        }).dimensions(8 + (fxW + gap) * 2, fxY, fxW + 20, fxH).build());
+        sortNameBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Name"), b -> { sortKey = SortKey.NAME; refilterAndSort(); })
+                .dimensions(sx, sortRowY, bw, bh).build());
+        sortIdBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("ID"), b -> { sortKey = SortKey.ID; refilterAndSort(); })
+                .dimensions(sx + (bw + gap), sortRowY, bw, bh).build());
+        sortVerBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Version"), b -> { sortKey = SortKey.VERSION; refilterAndSort(); })
+                .dimensions(sx + 2*(bw + gap), sortRowY, bw + 10, bh).build());
+        sortDirBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Asc"), b -> { sortAsc = !sortAsc; updateSortDirLabel(); refilterAndSort(); })
+                .dimensions(sx + 3*(bw + gap) + 10, sortRowY, 60, bh).build());
+        updateSortDirLabel();
 
         // Back button
-        int bw = 100, bh = 20;
+        int backW = 100;
         this.addDrawableChild(ButtonWidget.builder(Text.literal("Back"),
                 b -> MinecraftClient.getInstance().setScreen(parent))
-                .dimensions(this.width/2 - bw/2, this.height - 28, bw, bh).build());
+                .dimensions(this.width/2 - backW/2, this.height - 28, backW, bh).build());
 
         // Open Mods Folder
         int omw = 160;
@@ -167,20 +149,24 @@ public class ModsScreen extends Screen {
                 })
                 .dimensions(this.width - omw - 8, this.height - 28, omw, bh).build());
 
-        // --- QoL buttons (row above Back) ---
+        // --- QoL buttons (one row above Back) ---
         int y = this.height - 28 - 24;
         int spacing = 6;
-        int wCfg = 100, wReveal = 110, wSmall = 90;
+        int wCfg = 100, wReveal = 110, wSmall = 90, wToggle = 110;
+
         int center = this.width / 2;
 
+        // Configure: centered above Back
         configureBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Configure"),
                 b -> openConfigForSelected())
                 .dimensions(center - wCfg / 2, y, wCfg, bh).build());
 
+        // Reveal File: right of Configure
         revealBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Reveal File"),
                 b -> revealSelectedOnDisk())
                 .dimensions(center + wCfg / 2 + spacing, y, wReveal, bh).build());
 
+        // Copy Version & ID: to the left
         copyVerBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Copy Version"),
                 b -> copySelectedVersion())
                 .dimensions(center - wCfg / 2 - spacing - 120, y, 120, bh).build());
@@ -189,68 +175,67 @@ public class ModsScreen extends Screen {
                 b -> copySelectedId())
                 .dimensions(center - wCfg / 2 - spacing - 120 - spacing - wSmall, y, wSmall, bh).build());
 
+        // Export JSON — far left
         int exportW = 110;
         exportJsonBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Export JSON"),
                 b -> exportFilteredToJson())
                 .dimensions(center - wCfg / 2 - spacing - 120 - spacing - wSmall - spacing - exportW, y, exportW, bh)
                 .build());
 
-        // initial filter + sort with default state
-        refilterAndResort();
+        // NEW: Enable/Disable — far right of "Reveal File"
+        toggleEnableBtn = this.addDrawableChild(ButtonWidget.builder(Text.literal("Disable"),
+                b -> toggleEnableSelected())
+                .dimensions(center + wCfg / 2 + spacing + wReveal + spacing, y, wToggle, bh).build());
+
+        // Initial toggle state
+        refreshActionStates();
     }
 
-    // labels for filter buttons
-    private String labelClient() { return "Client: " + (showClient ? "ON" : "off"); }
-    private String labelServer() { return "Server: " + (showServer ? "ON" : "off"); }
-    private String labelLib()    { return "Libraries: " + (showLibraries ? "ON" : "off"); }
+    private void updateSortDirLabel() {
+        if (sortDirBtn != null) sortDirBtn.setMessage(Text.literal(sortAsc ? "Asc" : "Desc"));
+    }
 
-    private void refilterAndResort() {
-        String q = this.search == null ? "" : this.search.getText().trim().toLowerCase(Locale.ROOT);
+    /* ---------- Loading / filtering / sorting ---------- */
 
-        List<ModRow> base = this.allRows.stream()
-                .filter(r -> {
-                    // text query
-                    if (!q.isEmpty()) {
-                        if (!(r.nameL.contains(q) || r.idL.contains(q) || r.versionL.contains(q))) return false;
-                    }
-                    // env filter
-                    boolean envOk;
-                    if (r.env == ModEnvironment.CLIENT) envOk = showClient;
-                    else if (r.env == ModEnvironment.SERVER) envOk = showServer;
-                    else /* UNIVERSAL */ envOk = (showClient || showServer);
-                    if (!envOk) return false;
-
-                    // library filter
-                    if (!showLibraries && r.isLibrary) return false;
-                    return true;
-                })
+    private void reloadModsList() {
+        this.allRows = FabricLoader.getInstance()
+                .getAllMods()
+                .stream()
+                .filter(this::isFromRealModsDir)
+                .map(mc -> new ModRow(mc, mc.getMetadata()))
                 .collect(Collectors.toList());
+        refilterAndSort();
+        this.scrollY = 0;
+        this.hoverIndex = -1;
+        this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, filtered.size() - 1));
+    }
 
-        // sort (kept simple; adjust to your existing sorting controls if different)
+    private void refilterAndSort() {
+        String q = (this.search == null ? "" : this.search.getText()).trim().toLowerCase(Locale.ROOT);
+        if (q.isEmpty()) {
+            this.filtered = new ArrayList<>(this.allRows);
+        } else {
+            this.filtered = this.allRows.stream()
+                    .filter(r -> r.nameL.contains(q) || r.idL.contains(q) || r.versionL.contains(q))
+                    .collect(Collectors.toList());
+        }
+
         Comparator<ModRow> cmp;
         switch (sortKey) {
-            case ID: cmp = Comparator.comparing(r -> r.idL); break;
-            case VERSION: cmp = Comparator.comparing(r -> r.versionL); break;
-            case NAME:
-            default: cmp = Comparator.comparing(r -> r.nameL); break;
+            case ID -> cmp = Comparator.comparing(r -> r.idL);
+            case VERSION -> cmp = Comparator.comparing(r -> r.versionL);
+            case NAME -> cmp = Comparator.comparing(r -> r.nameL);
+            default -> cmp = Comparator.comparing(r -> r.nameL);
         }
         if (!sortAsc) cmp = cmp.reversed();
-        base.sort(cmp);
-
-        this.filtered = base;
-
-        // keep selection within bounds
-        if (this.selectedIndex >= filtered.size()) {
-            this.selectedIndex = filtered.isEmpty() ? -1 : filtered.size() - 1;
-        }
-        // reset hover & scroll if search changed dramatically (fine to leave as-is)
-        if (scrollY < 0) scrollY = 0;
+        this.filtered.sort(cmp);
     }
 
     private boolean isFromRealModsDir(ModContainer mc) {
         try {
             return mc.getOrigin().getPaths().stream().anyMatch(p -> {
                 Path abs = p.toAbsolutePath().normalize();
+                // Only count mods physically inside the real mods dir (incl. mods/disabled)
                 return abs.startsWith(this.realModsDir);
             });
         } catch (Throwable t) {
@@ -271,13 +256,13 @@ public class ModsScreen extends Screen {
         if (scrollY > maxScroll) scrollY = maxScroll;
     }
 
-    // NOTE: no @Override here (mappings vary)
+    // NOTE: no @Override here (mappings differ)
     public boolean mouseScrolled(double mouseX, double mouseY, double amount) {
         scrollBy((int) (-amount * 24));
         return true;
     }
 
-    // NOTE: no @Override here (mappings vary)
+    // NOTE: no @Override here (mappings differ)
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
         // Click-to-select within list pane
         int top = LIST_TOP_PAD;
@@ -292,31 +277,33 @@ public class ModsScreen extends Screen {
             int idx = relativeY / ROW_H;
             if (idx >= 0 && idx < filtered.size()) {
                 selectedIndex = idx;
+                refreshActionStates();
             }
             return true;
         }
+
+        // Don’t call super.mouseClicked(double,double,int)
         return false;
     }
 
     @Override
     public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
-        // dark backdrop
+        // Simple dark backdrop (no blur)
         ctx.fill(0, 0, this.width, this.height, 0xCC000000);
 
-        // title + search
+        // Title + controls
         ctx.drawTextWithShadow(this.textRenderer, this.getTitle(), 8, 2, 0xFFFFFFFF);
         this.search.render(ctx, mouseX, mouseY, delta);
-        // filter buttons are regular widgets; no custom render
 
-        // layout
-        int detailPaneW = Math.max(260, this.width / 3);
+        // Split layout: list on left, details on right
+        int detailPaneW = Math.max(260, this.width / 3); // right pane width
         int detailLeft = this.width - detailPaneW - 8;
         int listLeft = 8;
         int listRight = Math.max(detailLeft - 6, listLeft + 100);
         int top = LIST_TOP_PAD;
         int bottom = this.height - FOOTER_H;
 
-        // panels
+        // Panels
         ctx.fill(listLeft, top, listRight, bottom, 0x99000000);
         ctx.fill(detailLeft, top, this.width - 8, bottom, 0x66000000);
 
@@ -336,50 +323,53 @@ public class ModsScreen extends Screen {
 
                 boolean insideList =
                         mouseX >= listLeft && mouseX <= listRight &&
-                        mouseY >= rowTop && mouseY <= rowBottom;
+                                mouseY >= rowTop && mouseY <= rowBottom;
                 if (insideList) hoverIndex = i;
 
                 boolean isSelected = (i == selectedIndex);
-                int bg = isSelected ? 0x5533AAFF : (insideList ? 0x33FFFFFF : 0x22000000);
+                ModRow r = filtered.get(i);
+                boolean disabled = isDisabled(r);
+
+                int bg = isSelected
+                        ? 0x5533AAFF
+                        : (insideList ? 0x33FFFFFF : 0x22000000);
                 ctx.fill(listLeft + 1, rowTop, listRight - 1, rowBottom - 1, bg);
 
-                ModRow r = filtered.get(i);
                 int iconX = listLeft + 3;
                 int iconY = rowTop + 1;
 
-                // Placeholder "logo"
+                // Placeholder "logo square" (18x18) + initials
                 ctx.fill(iconX, iconY, iconX + 18, iconY + 18, 0xFF444444);
                 ctx.drawTextWithShadow(this.textRenderer, initials(r.name), iconX + 3, iconY + 4, 0xFFEFEFEF);
 
+                // Text columns
                 int textStart = iconX + 18 + 4;
                 int ty = rowTop + 6;
 
-                // tag suffix for env/lib
-                String tag = "";
-                if (r.env == ModEnvironment.CLIENT) tag = " [C]";
-                else if (r.env == ModEnvironment.SERVER) tag = " [S]";
-                if (r.isLibrary) tag += " [L]";
+                String nameText = disabled ? (r.name + "  [DISABLED]") : r.name;
+                int nameColor = disabled ? 0xFFAAAAAA : 0xFFFFFFFF;
+                ctx.drawTextWithShadow(this.textRenderer, nameText, textStart, ty, nameColor);
 
-                ctx.drawTextWithShadow(this.textRenderer, r.name + tag, textStart, ty, 0xFFFFFFFF);
-
-                int idX = Math.max(textStart + 6 + this.textRenderer.getWidth(r.name + tag), listLeft + 240);
+                int idX = Math.max(textStart + 6 + this.textRenderer.getWidth(nameText), listLeft + 240);
                 ctx.drawTextWithShadow(this.textRenderer, r.id, idX, ty, 0xFFDDDDDD);
 
-                int verX = Math.max(idX + 6 + this.textRenderer.getWidth(r.id), listLeft + 400);
-                ctx.drawTextWithShadow(this.textRenderer, r.version, verX, ty, 0xFFA0FFA0);
+                int verX = Math.max(idX + 6 + this.textRenderer.getWidth(r.id), listLeft + 420);
+                int verColor = disabled ? 0xFFB0B0B0 : 0xFFA0FFA0;
+                ctx.drawTextWithShadow(this.textRenderer, r.version, verX, ty, verColor);
             }
         }
 
-        // DETAILS PANE — builds linkSpans each frame
+        // DETAILS PANE (right side) — builds linkSpans every frame
         linkSpans.clear();
         drawDetailsPane(ctx, detailLeft, top, detailPaneW, bottom);
 
-        // click edges (links)
+        // ---- CLICK EDGE DETECTION ----
         long handle = MinecraftClient.getInstance().getWindow().getHandle();
         boolean mouseDown = org.lwjgl.glfw.GLFW.glfwGetMouseButton(
                 handle, org.lwjgl.glfw.GLFW.GLFW_MOUSE_BUTTON_LEFT) == org.lwjgl.glfw.GLFW.GLFW_PRESS;
 
         if (mouseDown && !prevMouseDown) {
+            // 1) If click is on a link, open it.
             for (LinkSpan s : linkSpans) {
                 if (s.contains(mouseX, mouseY)) {
                     openUrl(s.url);
@@ -388,34 +378,20 @@ public class ModsScreen extends Screen {
                     break;
                 }
             }
+            // 2) If not on link but on a list row, select it
             if (!linkHit(mouseX, mouseY) && hoverIndex >= 0 && hoverIndex < filtered.size()) {
                 selectedIndex = hoverIndex;
+                refreshActionStates();
             }
         }
         prevMouseDown = mouseDown;
 
-        // footer
+        // Footer line + count
         ctx.fill(listLeft, bottom, this.width - 8, bottom + 1, 0x77FFFFFF);
         String count = "Showing " + filtered.size() + " / " + allRows.size() + " mods";
         ctx.drawTextWithShadow(this.textRenderer, count, 8, this.height - 28 - 14, 0xFFAAAAAA);
 
-        // bottom buttons state
-        boolean hasSelection = (selectedIndex >= 0 && selectedIndex < filtered.size());
-        boolean cfgActive = false;
-        if (hasSelection) {
-            String modId = filtered.get(selectedIndex).id;
-            try {
-                Map<String, com.terraformersmc.modmenu.api.ConfigScreenFactory<?>> fx =
-                        com.majed.simplemenu.integrations.ModMenuShim.collectFactoriesForMod(modId);
-                cfgActive = (fx != null && !fx.isEmpty());
-            } catch (Throwable ignored) {}
-        }
-        if (configureBtn != null) configureBtn.active = hasSelection && cfgActive;
-        if (revealBtn != null)    revealBtn.active    = hasSelection;
-        if (copyIdBtn != null)    copyIdBtn.active    = hasSelection;
-        if (copyVerBtn != null)   copyVerBtn.active   = hasSelection;
-        if (exportJsonBtn != null) exportJsonBtn.active = true;
-
+        // Tiny toast
         if (hudMsg != null && Util.getMeasuringTimeMs() < hudUntilMs) {
             ctx.drawTextWithShadow(this.textRenderer, hudMsg, 10, this.height - 44, 0xFFECECEC);
         }
@@ -423,7 +399,7 @@ public class ModsScreen extends Screen {
         super.render(ctx, mouseX, mouseY, delta);
     }
 
-    // ---------- Export helpers ----------
+    /* ---------- Export helpers ---------- */
     private void exportFilteredToJson() {
         try {
             String json = buildJson(filtered);
@@ -474,7 +450,7 @@ public class ModsScreen extends Screen {
         }
         return out.toString();
     }
-    // ---------- /Export helpers ----------
+    /* ---------- /Export helpers ---------- */
 
     private void drawDetailsPane(DrawContext ctx, int left, int top, int paneW, int bottom) {
         int x = left + 8;
@@ -486,13 +462,16 @@ public class ModsScreen extends Screen {
         }
 
         ModRow r = filtered.get(selectedIndex);
+        boolean disabled = isDisabled(r);
 
         // Placeholder large logo
         ctx.fill(x, y, x + 48, y + 48, 0xFF444444);
         ctx.drawTextWithShadow(this.textRenderer, initials(r.name), x + 10, y + 18, 0xFFEFEFEF);
 
         int tx = x + 48 + 8;
-        ctx.drawTextWithShadow(this.textRenderer, r.name, tx, y + 2, 0xFFFFFFFF); y += 18;
+        String header = disabled ? (r.name + "  [DISABLED]") : r.name;
+        int headColor = disabled ? 0xFFAAAAAA : 0xFFFFFFFF;
+        ctx.drawTextWithShadow(this.textRenderer, header, tx, y + 2, headColor); y += 18;
         ctx.drawTextWithShadow(this.textRenderer, "ID: " + r.id, tx, y + 2, 0xFFDDDDDD); y += 14;
         ctx.drawTextWithShadow(this.textRenderer, "Version: " + r.version, tx, y + 2, 0xFFAAFFAA); y += 16;
 
@@ -513,7 +492,7 @@ public class ModsScreen extends Screen {
             y += 12;
         }
 
-        // Contact links — draw label + clickable URL; register a hitbox
+        // Contact links — draw label + blue, underlined URL; add clickable rect
         String homepage = r.meta.getContact().get("homepage").orElse(null);
         String sources  = r.meta.getContact().get("sources").orElse(null);
         String issues   = r.meta.getContact().get("issues").orElse(null);
@@ -538,7 +517,7 @@ public class ModsScreen extends Screen {
             }
         }
 
-        // Dependencies
+        // -------- Dependencies --------
         DepInfo deps = loadDepInfo(r);
         if (!deps.isEmpty()) {
             y += 8;
@@ -558,9 +537,10 @@ public class ModsScreen extends Screen {
                 y += 2;
             }
         }
+        // -----------------------------------
     }
 
-    // clickable link line
+    // Draw a label + clickable URL, underline the URL, register a hitbox, advance Y
     private int drawLinkLine(DrawContext ctx, String label, String url, int x, int y) {
         int labelColor = 0xFFAAAAFF;
         int linkColor = 0xFF55AAFF;
@@ -570,13 +550,16 @@ public class ModsScreen extends Screen {
         ctx.drawTextWithShadow(this.textRenderer, url, urlX, y, linkColor);
 
         int urlW = this.textRenderer.getWidth(url);
-        ctx.fill(urlX, y + 10, urlX + urlW, y + 11, linkColor); // underline
+        // underline (a thin line just under the text)
+        ctx.fill(urlX, y + 10, urlX + urlW, y + 11, linkColor);
 
+        // record clickable area (roughly one line high)
         linkSpans.add(new LinkSpan(urlX, y, urlW, 12, url));
+
         return y + 12;
     }
 
-    // wrap helper
+    // Wrap helper
     private int wrapAndDraw(DrawContext ctx, String text, int x, int startY, int maxW, int color) {
         List<OrderedText> wrapped = this.textRenderer.wrapLines(Text.literal(text), Math.max(20, maxW));
         int y = startY;
@@ -587,7 +570,7 @@ public class ModsScreen extends Screen {
         return y;
     }
 
-    // --------- Dependency reader ---------
+    /* --------- Dependency reader --------- */
     private static class DepInfo {
         final List<String> depends = new ArrayList<>();
         final List<String> recommends = new ArrayList<>();
@@ -600,17 +583,19 @@ public class ModsScreen extends Screen {
     private DepInfo loadDepInfo(ModRow r) {
         DepInfo out = new DepInfo();
         try {
-            Path p = anyOriginPath(r.container);
+            Path p = primaryPath(r);
             if (p == null) return out;
 
             JsonObject root = readFabricJson(p);
             if (root == null) return out;
 
+            // Keys to read. "breaks" is treated as conflicts too.
             collectIds(root, "depends", out.depends);
             collectIds(root, "recommends", out.recommends);
             collectIds(root, "conflicts", out.conflicts);
             collectIds(root, "breaks", out.conflicts);
 
+            // Clean + dedupe in place
             dedupeInPlace(out.depends);
             dedupeInPlace(out.recommends);
             dedupeInPlace(out.conflicts);
@@ -691,7 +676,143 @@ public class ModsScreen extends Screen {
         } catch (Throwable ignored) { }
         return null;
     }
-    // --------- /Dependency reader ---------
+    /* --------- /Dependency reader --------- */
+
+    /* ---------- Enable/Disable ---------- */
+
+    private boolean isDisabled(ModRow r) {
+        Path p = primaryPath(r);
+        if (p == null) return false;
+        try {
+            Path abs = p.toAbsolutePath().normalize();
+            return abs.startsWith(realModsDir.resolve("disabled").normalize());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void toggleEnableSelected() {
+        if (selectedIndex < 0 || selectedIndex >= filtered.size()) return;
+        ModRow r = filtered.get(selectedIndex);
+        if (isDisabled(r)) {
+            enableSelected(r);
+        } else {
+            disableSelected(r);
+        }
+    }
+
+    private void disableSelected(ModRow r) {
+        Path src = primaryPath(r);
+        if (src == null) { toast("No file on disk"); return; }
+        try {
+            Path disabledDir = realModsDir.resolve("disabled");
+            Files.createDirectories(disabledDir);
+
+            Path target = disabledDir.resolve(src.getFileName().toString());
+            target = uniqueDestination(target); // avoid clobber
+
+            Files.move(src, target, StandardCopyOption.ATOMIC_MOVE);
+            toast("Disabled: moved to mods/disabled/");
+            reloadModsList();
+            refreshActionStates();
+        } catch (AtomicMoveNotSupportedException amnse) {
+            try {
+                Path disabledDir = realModsDir.resolve("disabled");
+                Files.createDirectories(disabledDir);
+                Path target = disabledDir.resolve(src.getFileName().toString());
+                target = uniqueDestination(target);
+                Files.move(src, target); // non-atomic fallback
+                toast("Disabled: moved to mods/disabled/");
+                reloadModsList();
+                refreshActionStates();
+            } catch (Exception e2) {
+                toast("Disable failed");
+            }
+        } catch (Exception e) {
+            toast("Disable failed");
+        }
+    }
+
+    private void enableSelected(ModRow r) {
+        Path src = primaryPath(r);
+        if (src == null) { toast("No file on disk"); return; }
+        try {
+            // move back into the mods root
+            Path target = realModsDir.resolve(src.getFileName().toString());
+            target = uniqueDestination(target);
+
+            Files.move(src, target, StandardCopyOption.ATOMIC_MOVE);
+            toast("Enabled: moved back to mods/");
+            reloadModsList();
+            refreshActionStates();
+        } catch (AtomicMoveNotSupportedException amnse) {
+            try {
+                Path target = realModsDir.resolve(src.getFileName().toString());
+                target = uniqueDestination(target);
+                Files.move(src, target);
+                toast("Enabled: moved back to mods/");
+                reloadModsList();
+                refreshActionStates();
+            } catch (Exception e2) {
+                toast("Enable failed");
+            }
+        } catch (Exception e) {
+            toast("Enable failed");
+        }
+    }
+
+    private Path uniqueDestination(Path desired) {
+        if (!Files.exists(desired)) return desired;
+        String name = desired.getFileName().toString();
+        String base, ext;
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) {
+            base = name.substring(0, dot);
+            ext = name.substring(dot);
+        } else {
+            base = name;
+            ext = "";
+        }
+        int n = 1;
+        Path parent = desired.getParent();
+        Path candidate;
+        do {
+            candidate = parent.resolve(base + " (" + n + ")" + ext);
+            n++;
+        } while (Files.exists(candidate));
+        return candidate;
+    }
+
+    private void refreshActionStates() {
+        boolean hasSelection = (selectedIndex >= 0 && selectedIndex < filtered.size());
+        boolean cfgActive = false;
+        if (hasSelection) {
+            String modId = filtered.get(selectedIndex).id;
+            try {
+                Map<String, com.terraformersmc.modmenu.api.ConfigScreenFactory<?>> fx =
+                        com.majed.simplemenu.integrations.ModMenuShim.collectFactoriesForMod(modId);
+                cfgActive = (fx != null && !fx.isEmpty());
+            } catch (Throwable ignored) {}
+        }
+        if (configureBtn != null) configureBtn.active = hasSelection && cfgActive;
+        if (revealBtn != null)    revealBtn.active    = hasSelection;
+        if (copyIdBtn != null)    copyIdBtn.active    = hasSelection;
+        if (copyVerBtn != null)   copyVerBtn.active   = hasSelection;
+        if (exportJsonBtn != null) exportJsonBtn.active = true;
+
+        if (toggleEnableBtn != null) {
+            if (!hasSelection) {
+                toggleEnableBtn.active = false;
+                toggleEnableBtn.setMessage(Text.literal("Disable"));
+            } else {
+                boolean disabled = isDisabled(filtered.get(selectedIndex));
+                toggleEnableBtn.active = true;
+                toggleEnableBtn.setMessage(Text.literal(disabled ? "Enable" : "Disable"));
+            }
+        }
+    }
+
+    /* ---------- Other actions ---------- */
 
     private void openConfigForSelected() {
         if (selectedIndex < 0 || selectedIndex >= filtered.size()) return;
@@ -756,6 +877,7 @@ public class ModsScreen extends Screen {
     private void openUrl(String url) {
         if (url == null || url.isBlank()) return;
         try {
+            // Minecraft helper (uses OS)
             Util.getOperatingSystem().open(url);
             toast("Opening: " + url);
         } catch (Throwable t1) {
@@ -766,6 +888,7 @@ public class ModsScreen extends Screen {
                     return;
                 }
             } catch (Throwable ignored) {}
+            // Fallback: copy to clipboard
             MinecraftClient.getInstance().keyboard.setClipboard(url);
             toast("Link copied to clipboard");
         }
@@ -785,19 +908,13 @@ public class ModsScreen extends Screen {
 
     private Path primaryPath(ModRow r) {
         try {
+            // Prefer something inside the real mods dir, otherwise first origin path
             Optional<Path> insideMods = r.container.getOrigin().getPaths().stream()
                     .map(Path::toAbsolutePath).map(Path::normalize)
                     .filter(p -> p.startsWith(this.realModsDir)).findFirst();
             if (insideMods.isPresent()) return insideMods.get();
-            return anyOriginPath(r.container);
-        } catch (Throwable t) {
-            return null;
-        }
-    }
 
-    private static Path anyOriginPath(ModContainer c) {
-        try {
-            return c.getOrigin().getPaths().stream().findFirst().orElse(null);
+            return r.container.getOrigin().getPaths().stream().findFirst().orElse(null);
         } catch (Throwable t) {
             return null;
         }
@@ -811,51 +928,17 @@ public class ModsScreen extends Screen {
         return (a + b);
     }
 
+    // Prefer the user's real .minecraft\mods on Windows; fallback to dev run\mods
     private static Path resolvePreferredModsDir() {
         String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
         if (os.contains("win")) {
-            String appdata = System.getenv("APPDATA");
+            String appdata = System.getenv("APPDATA"); // e.g. C:\Users\<you>\AppData\Roaming
             if (appdata != null && !appdata.isBlank()) {
                 return Paths.get(appdata, ".minecraft", "mods");
             }
         }
         Path gameDir = FabricLoader.getInstance().getGameDir();
         return gameDir.resolve("mods");
-    }
-
-    // detect env + library safely
-    private void fillEnvAndLibrary(ModRow r) {
-        // environment
-        try {
-            r.env = r.meta.getEnvironment(); // CLIENT/SERVER/UNIVERSAL
-            if (r.env == null) r.env = ModEnvironment.UNIVERSAL;
-        } catch (Throwable t) {
-            r.env = ModEnvironment.UNIVERSAL;
-        }
-
-        // library: read fabric.mod.json if available
-        boolean lib = false;
-        try {
-            Path p = anyOriginPath(r.container);
-            JsonObject root = (p == null) ? null : readFabricJson(p);
-            if (root != null) {
-                if (root.has("type")) {
-                    String t = root.get("type").getAsString();
-                    if (t != null && t.equalsIgnoreCase("library")) lib = true;
-                }
-                // heuristic: if no entrypoints declared, likely a library/helper jar
-                if (!lib) {
-                    if (!root.has("entrypoints")) lib = true;
-                    else {
-                        JsonElement ep = root.get("entrypoints");
-                        if (ep != null && ep.isJsonObject() && ep.getAsJsonObject().entrySet().isEmpty()) {
-                            lib = true;
-                        }
-                    }
-                }
-            }
-        } catch (Throwable ignored) {}
-        r.isLibrary = lib;
     }
 
     /** Public so other screens could reference if needed. */
@@ -870,10 +953,6 @@ public class ModsScreen extends Screen {
         public final String nameL;
         public final String idL;
         public final String versionL;
-
-        // enriched
-        public ModEnvironment env = ModEnvironment.UNIVERSAL;
-        public boolean isLibrary = false;
 
         ModRow(ModContainer container, ModMetadata m) {
             this.container = container;
